@@ -1,0 +1,17 @@
+# Simulates an Ubuntu 22.04 LTS fleet node
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y openssh-server python3 sudo cron update-notifier-common && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /var/run/sshd && \
+    mkdir -p /root/.ssh && \
+    chmod 700 /root/.ssh
+
+COPY id_rsa_ansible.pub /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+
+EXPOSE 22
+CMD ["/bin/sh", "-c", "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"]

@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Linux patching lab: local secrets / generated files ---
+id_rsa_ansible.pub
+*.pem
+.env
+ansible/*.retry
+reports/
+

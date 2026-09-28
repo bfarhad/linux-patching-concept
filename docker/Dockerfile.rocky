@@ -1,0 +1,15 @@
+# Simulates a RHEL 9 fleet node (Rocky Linux is binary-compatible with RHEL)
+FROM rockylinux:9
+
+RUN dnf -y install openssh-server python3 sudo cronie dnf-utils && \
+    dnf clean all && \
+    ssh-keygen -A && \
+    mkdir -p /root/.ssh && \
+    chmod 700 /root/.ssh
+
+COPY id_rsa_ansible.pub /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+
+# Force sshd to run in the foreground so the container stays alive
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

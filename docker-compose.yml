@@ -1,0 +1,199 @@
+# ------------------------------------------------------------------
+# Enterprise Multi-Distro Linux Patch Management Lab
+#
+#   docker compose up -d rhel-node ubuntu-node debian-node   # fleet only
+#   docker compose --profile awx up -d                        # fleet + AWX
+#
+# See README.md for full usage.
+# ------------------------------------------------------------------
+
+services:
+  # ---------------- TARGET PATCH NODES ----------------
+  rhel-node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rocky
+    container_name: rhel-node
+    hostname: rhel-node
+    ports:
+      - "2221:22"
+    networks:
+      - lab-net
+    tmpfs:
+      - /run
+      - /run/lock
+
+  ubuntu-node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ubuntu
+    container_name: ubuntu-node
+    hostname: ubuntu-node
+    ports:
+      - "2222:22"
+    networks:
+      - lab-net
+    tmpfs:
+      - /run
+      - /run/lock
+
+  debian-node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.debian
+    container_name: debian-node
+    hostname: debian-node
+    ports:
+      - "2223:22"
+    networks:
+      - lab-net
+    tmpfs:
+      - /run
+      - /run/lock
+
+  # ---------------- AWX CONTROL PLANE (optional, browser reachable) ----------------
+  # Hand-wired from the *production* ghcr.io/ansible/awx image, which ships
+  # with no baked-in nginx/Django config (those are normally injected by the
+  # Kubernetes operator). awx-config/ supplies the missing nginx.conf and
+  # settings.py (pointed at TCP redis/postgres) so the same image works
+  # standalone under plain docker compose. See README.md "AWX control plane" section
+  # for exactly what this can and cannot do (job *execution* needs a real
+  # execution-environment runtime, which this slim image does not include).
+  awx-postgres:
+    image: postgres:15
+    profiles: ["awx"]
+    container_name: awx-postgres
+    hostname: awx-postgres
+    environment:
+      POSTGRES_DB: awx
+      POSTGRES_USER: awx
+      POSTGRES_PASSWORD: ${AWX_POSTGRES_PASSWORD:-awxpassword}
+    volumes:
+      - awx_postgres_data:/var/lib/postgresql/data
+    networks:
+      - lab-net
+
+  awx-redis:
+    image: redis:7
+    profiles: ["awx"]
+    container_name: awx-redis
+    hostname: awx-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks:
+      - lab-net
+
+  # One-shot: runs DB migrations, preload data and creates the admin user,
+  # then exits. awx-web/awx-task wait for it to finish successfully.
+  awx-migrations:
+    image: ${AWX_IMAGE:-ghcr.io/ansible/awx:23.8.1}
+    profiles: ["awx"]
+    container_name: awx-migrations
+    depends_on:
+      - awx-postgres
+      - awx-redis
+    environment:
+      DATABASE_HOST: awx-postgres
+      DATABASE_NAME: awx
+      DATABASE_USER: awx
+      DATABASE_PASSWORD: ${AWX_POSTGRES_PASSWORD:-awxpassword}
+      AWX_SECRET_KEY: ${AWX_SECRET_KEY:-please-change-me-lab-only}
+      AWX_ADMIN_USER: ${AWX_ADMIN_USER:-admin}
+      AWX_ADMIN_PASSWORD: ${AWX_ADMIN_PASSWORD:-adminpassword}
+      CLUSTER_HOST_ID: awx
+    entrypoint: ["/bin/bash", "/awx-config/migrate.sh"]
+    volumes:
+      - ./awx-config/settings.py:/etc/tower/settings.py:ro
+      - ./awx-config/migrate.sh:/awx-config/migrate.sh:ro
+      - awx_projects:/var/lib/awx/projects
+    networks:
+      - lab-net
+
+  awx-web:
+    image: ${AWX_IMAGE:-ghcr.io/ansible/awx:23.8.1}
+    profiles: ["awx"]
+    container_name: awx-web
+    hostname: awx-web
+    depends_on:
+      awx-migrations:
+        condition: service_completed_successfully
+      awx-redis:
+        condition: service_started
+    command: ["/usr/bin/launch_awx_web.sh"]
+    ports:
+      - "8050:8052"
+    environment:
+      DATABASE_HOST: awx-postgres
+      DATABASE_NAME: awx
+      DATABASE_USER: awx
+      DATABASE_PASSWORD: ${AWX_POSTGRES_PASSWORD:-awxpassword}
+      AWX_SECRET_KEY: ${AWX_SECRET_KEY:-please-change-me-lab-only}
+      CLUSTER_HOST_ID: awx
+    volumes:
+      - ./awx-config/settings.py:/etc/tower/settings.py:ro
+      - ./awx-config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - awx_projects:/var/lib/awx/projects
+    networks:
+      - lab-net
+
+  awx-task:
+    image: ${AWX_IMAGE:-ghcr.io/ansible/awx:23.8.1}
+    profiles: ["awx"]
+    container_name: awx-task
+    hostname: awx-task
+    depends_on:
+      awx-migrations:
+        condition: service_completed_successfully
+      awx-redis:
+        condition: service_started
+      awx-receptor:
+        condition: service_started
+    # launch_awx_task.sh calls `awx-manage provision_instance` with no
+    # --hostname, which only works when AWX_AUTO_DEPROVISION_INSTANCES is
+    # set (a Kubernetes-operator-only setting). migrate.sh already
+    # registered this instance explicitly, so just wait for migrations and
+    # start the task supervisord group directly. job_status/ is also normally
+    # created by the operator; a periodic cleanup task fails without it.
+    command: ["/bin/bash", "-c", "mkdir -p /var/lib/awx/job_status && wait-for-migrations && exec supervisord -c /etc/supervisord_task.conf"]
+    environment:
+      DATABASE_HOST: awx-postgres
+      DATABASE_NAME: awx
+      DATABASE_USER: awx
+      DATABASE_PASSWORD: ${AWX_POSTGRES_PASSWORD:-awxpassword}
+      AWX_SECRET_KEY: ${AWX_SECRET_KEY:-please-change-me-lab-only}
+      CLUSTER_HOST_ID: awx
+    volumes:
+      - ./awx-config/settings.py:/etc/tower/settings.py:ro
+      - ./awx-config/receptor.conf:/etc/receptor/receptor.conf:ro
+      - awx_receptor_sock:/var/run/receptor
+      - awx_projects:/var/lib/awx/projects
+      - ~/.ssh/id_rsa_ansible:/etc/awx-ssh/id_rsa_ansible:ro
+    networks:
+      - lab-net
+
+  # Receptor sidecar (same pattern the AWX operator uses: an awx-ee
+  # container next to awx-task). awx-task's dispatcher talks to it over a
+  # shared unix socket and exits at startup if it can't.
+  awx-receptor:
+    image: ${AWX_EE_IMAGE:-quay.io/ansible/awx-ee:23.8.1}
+    profiles: ["awx"]
+    container_name: awx-receptor
+    hostname: awx-receptor
+    # The fresh named volume is root-owned; the socket ends up root:root 0660,
+    # which awx-task (uid 1000, gid 0) can still use via its root group.
+    user: "0"
+    command: ["receptor", "--config", "/etc/receptor/receptor.conf"]
+    volumes:
+      - ./awx-config/receptor.conf:/etc/receptor/receptor.conf:ro
+      - awx_receptor_sock:/var/run/receptor
+      - awx_projects:/var/lib/awx/projects
+    networks:
+      - lab-net
+
+networks:
+  lab-net:
+    driver: bridge
+
+volumes:
+  awx_postgres_data:
+  awx_projects:
+  awx_receptor_sock:
