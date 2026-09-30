@@ -60,6 +60,17 @@
         patch_message: "Unsupported OS family '{{ ansible_os_family }}' - no patch strategy defined"
       when: ansible_os_family not in ["RedHat", "Debian"]
 
+    # `dnf needs-restarting` lives in dnf-plugins-core. Without it dnf exits 1
+    # ("No such command"), which would be misread as "reboot required".
+    - name: Ensure needs-restarting is available (RedHat family)
+      ansible.builtin.dnf:
+        name: dnf-plugins-core
+        state: present
+      failed_when: false
+      when:
+        - ansible_os_family == "RedHat"
+        - patch_status == "success"
+
     - name: Check if reboot is required (RedHat family)
       ansible.builtin.command: dnf needs-restarting -r
       register: rhel_reboot_check
@@ -77,13 +88,16 @@
         - ansible_os_family == "Debian"
         - patch_status == "success"
 
+    # Skipped tasks still register a variable (without rc/stat), so every
+    # lookup below is defaulted - otherwise a failed RedHat patch would make
+    # `rhel_reboot_check.rc` blow up with "has no attribute 'rc'".
     - name: Record reboot requirement
       ansible.builtin.set_fact:
         reboot_required: >-
           {{
-            (ansible_os_family == "RedHat" and rhel_reboot_check is defined and rhel_reboot_check.rc == 1)
+            (ansible_os_family == "RedHat" and (rhel_reboot_check.rc | default(0)) == 1)
             or
-            (ansible_os_family == "Debian" and debian_reboot_check is defined and debian_reboot_check.stat.exists | default(false))
+            (ansible_os_family == "Debian" and (debian_reboot_check.stat.exists | default(false)))
           }}
 
     # NOTE: the actual reboot is intentionally NOT executed here. Rebooting a
@@ -99,10 +113,18 @@
   connection: local
   gather_facts: no
   vars:
-    report_dir: "{{ playbook_dir }}/../reports"
-    report_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    # Override with -e patch_report_dir=/some/path (e.g. a mounted volume in AWX).
+    # In AWX the default lands in the job's throwaway private data dir, so the
+    # report is also published as job artifacts via set_stats below.
+    report_dir: "{{ patch_report_dir | default(playbook_dir ~ '/../reports') }}"
 
   tasks:
+    # Evaluate the timestamp ONCE. As a play var it is lazily re-evaluated on
+    # every use, so the file name and the failure message could differ.
+    - name: Freeze report timestamp
+      ansible.builtin.set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
     - name: Ensure report directory exists
       ansible.builtin.file:
         path: "{{ report_dir }}"
@@ -114,28 +136,37 @@
         patch_rows: "{{ patch_rows | default([]) + [{
           'host': item,
           'distribution': (hostvars[item].ansible_distribution | default('unknown')) ~ ' ' ~ (hostvars[item].ansible_distribution_version | default('')),
-          'status': hostvars[item].patch_status | default('unknown'),
+          'status': hostvars[item].patch_status | default('unreachable'),
           'changed': hostvars[item].patch_changed | default(false),
           'reboot_required': hostvars[item].reboot_required | default(false),
-          'message': hostvars[item].patch_message | default('no result recorded')
+          'message': hostvars[item].patch_message | default('no result recorded (host unreachable or play aborted)')
           }] }}"
-      loop: "{{ groups['linux_cluster'] }}"
+      loop: "{{ groups['linux_cluster'] | default([]) }}"
 
     - name: Print fleet patch summary
       ansible.builtin.debug:
-        msg: "{{ '%-14s %-22s %-8s %-9s %-9s %s' | format(item.host, item.distribution, item.status, ('changed' if item.changed else 'no-op'), ('reboot' if item.reboot_required else 'ok'), item.message) }}"
-      loop: "{{ patch_rows }}"
+        msg: "{{ '%-14s %-22s %-11s %-9s %-9s %s' | format(item.host, item.distribution, item.status, ('changed' if item.changed else 'no-op'), ('reboot' if item.reboot_required else 'ok'), item.message) }}"
+      loop: "{{ patch_rows | default([]) }}"
       loop_control:
         label: "{{ item.host }}"
 
     - name: Write JSON patch report
       ansible.builtin.copy:
-        content: "{{ patch_rows | to_nice_json }}\n"
+        content: "{{ patch_rows | default([]) | to_nice_json }}\n"
         dest: "{{ report_dir }}/patch_report_{{ report_timestamp }}.json"
 
-    - name: Identify hosts that failed to patch
+    # Shows up under the AWX job's "Artifacts" and is passed to later
+    # workflow nodes (e.g. a notification / ticketing step).
+    - name: Publish report as AWX job artifacts
+      ansible.builtin.set_stats:
+        data:
+          patch_report: "{{ patch_rows | default([]) }}"
+          patch_report_timestamp: "{{ report_timestamp }}"
+        per_host: false
+
+    - name: Identify hosts that failed to patch (incl. unreachable)
       ansible.builtin.set_fact:
-        failed_hosts: "{{ patch_rows | selectattr('status', 'equalto', 'failed') | map(attribute='host') | list }}"
+        failed_hosts: "{{ patch_rows | default([]) | selectattr('status', 'in', ['failed', 'unreachable']) | map(attribute='host') | list }}"
 
     - name: Fail the run if any node failed to patch
       ansible.builtin.fail:

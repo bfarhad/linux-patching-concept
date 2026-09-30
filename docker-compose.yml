@@ -57,8 +57,7 @@ services:
   # Kubernetes operator). awx-config/ supplies the missing nginx.conf and
   # settings.py (pointed at TCP redis/postgres) so the same image works
   # standalone under plain docker compose. See README.md "AWX control plane" section
-  # for exactly what this can and cannot do (job *execution* needs a real
-  # execution-environment runtime, which this slim image does not include).
+  # for details. Jobs execute in the awx-receptor sidecar via podman.
   awx-postgres:
     image: postgres:15
     profiles: ["awx"]
@@ -82,6 +81,20 @@ services:
     networks:
       - lab-net
 
+  # One-shot: the AWX image has no /var/lib/awx/projects, so Docker creates the
+  # awx_projects volume root as root:root 0755. AWX (uid 1000) writes
+  # <project>.lock files there before every job and fails without this.
+  awx-projects-perms:
+    image: ${AWX_IMAGE:-ghcr.io/ansible/awx:23.8.1}
+    profiles: ["awx"]
+    container_name: awx-projects-perms
+    user: "0"
+    # Same for awx_job_data, where awx-task creates each job's private data dir.
+    entrypoint: ["/bin/sh", "-c", "chown 1000:0 /var/lib/awx/projects /var/lib/awx/job_data && chmod 0775 /var/lib/awx/projects /var/lib/awx/job_data"]
+    volumes:
+      - awx_projects:/var/lib/awx/projects
+      - awx_job_data:/var/lib/awx/job_data
+
   # One-shot: runs DB migrations, preload data and creates the admin user,
   # then exits. awx-web/awx-task wait for it to finish successfully.
   awx-migrations:
@@ -89,8 +102,12 @@ services:
     profiles: ["awx"]
     container_name: awx-migrations
     depends_on:
-      - awx-postgres
-      - awx-redis
+      awx-postgres:
+        condition: service_started
+      awx-redis:
+        condition: service_started
+      awx-projects-perms:
+        condition: service_completed_successfully
     environment:
       DATABASE_HOST: awx-postgres
       DATABASE_NAME: awx
@@ -132,6 +149,9 @@ services:
       - ./awx-config/settings.py:/etc/tower/settings.py:ro
       - ./awx-config/nginx.conf:/etc/nginx/nginx.conf:ro
       - awx_projects:/var/lib/awx/projects
+      # Manual project 'Linux Patch Management' (local_path=linux-patch-management)
+      # reads the playbooks straight from the repo, so edits show up without a copy.
+      - ./ansible:/var/lib/awx/projects/linux-patch-management:ro
     networks:
       - lab-net
 
@@ -140,6 +160,11 @@ services:
     profiles: ["awx"]
     container_name: awx-task
     hostname: awx-task
+    # Same uid as awx-receptor. Both write each job's private data dir in the
+    # shared awx_job_data volume: the ansible-runner worker (root) creates
+    # artifacts such as artifacts/<id>/command with mode 0600, and awx-task
+    # re-extracts the streamed artifacts over them when the job ends.
+    user: "0"
     depends_on:
       awx-migrations:
         condition: service_completed_successfully
@@ -166,6 +191,10 @@ services:
       - ./awx-config/receptor.conf:/etc/receptor/receptor.conf:ro
       - awx_receptor_sock:/var/run/receptor
       - awx_projects:/var/lib/awx/projects
+      # Manual project 'Linux Patch Management' (local_path=linux-patch-management)
+      # reads the playbooks straight from the repo, so edits show up without a copy.
+      - ./ansible:/var/lib/awx/projects/linux-patch-management:ro
+      - awx_job_data:/var/lib/awx/job_data
       - ~/.ssh/id_rsa_ansible:/etc/awx-ssh/id_rsa_ansible:ro
     networks:
       - lab-net
@@ -173,11 +202,21 @@ services:
   # Receptor sidecar (same pattern the AWX operator uses: an awx-ee
   # container next to awx-task). awx-task's dispatcher talks to it over a
   # shared unix socket and exits at startup if it can't.
+  #
+  # It is also the execution node: AWX runs each job as `podman run <EE>`
+  # here, so the image adds podman and the container is privileged. Job
+  # containers share this container's network (DEFAULT_CONTAINER_RUN_OPTIONS
+  # in settings.py), so they reach the fleet nodes over lab-net.
   awx-receptor:
-    image: ${AWX_EE_IMAGE:-quay.io/ansible/awx-ee:23.8.1}
+    build:
+      context: docker/awx-receptor
+      args:
+        AWX_EE_IMAGE: ${AWX_EE_IMAGE:-quay.io/ansible/awx-ee:23.8.1}
+    image: lab/awx-receptor:23.8.1
     profiles: ["awx"]
     container_name: awx-receptor
     hostname: awx-receptor
+    privileged: true
     # The fresh named volume is root-owned; the socket ends up root:root 0660,
     # which awx-task (uid 1000, gid 0) can still use via its root group.
     user: "0"
@@ -185,7 +224,11 @@ services:
     volumes:
       - ./awx-config/receptor.conf:/etc/receptor/receptor.conf:ro
       - awx_receptor_sock:/var/run/receptor
-      - awx_projects:/var/lib/awx/projects
+      # podman image store (EE image is pulled once, then reused). Must be a
+      # real volume: overlay-on-overlay storage fails.
+      - awx_receptor_containers:/var/lib/containers
+      # Shared with awx-task at the same path (AWX_ISOLATION_BASE_PATH).
+      - awx_job_data:/var/lib/awx/job_data
     networks:
       - lab-net
 
@@ -197,3 +240,5 @@ volumes:
   awx_postgres_data:
   awx_projects:
   awx_receptor_sock:
+  awx_receptor_containers:
+  awx_job_data:

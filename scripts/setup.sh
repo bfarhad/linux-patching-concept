@@ -27,9 +27,10 @@ docker compose up --build -d rhel-node ubuntu-node debian-node
 
 if [[ "${1:-}" == "--with-awx" ]]; then
   echo "==> Starting AWX control plane (this can take a few minutes on first run)..."
-  docker compose --profile awx up -d
+  docker compose --profile awx up -d --build   # --build: awx-receptor image (docker/awx-receptor)
   echo "    AWX web UI will be available at http://localhost:8050 once migrations finish."
   echo "    Tail startup with: docker compose logs -f awx-web"
+  echo "    Then provision AWX with: ./scripts/awx-configure.sh"
 fi
 
 echo "==> Waiting for SSH to come up on fleet nodes..."

@@ -2,11 +2,10 @@
 .SYNOPSIS
   Windows (PowerShell) equivalent of awx-run-now.sh - manually launches the
   "Weekly Enterprise Linux Patching" job template right now, regardless of
-  its schedule.
+  its schedule. Set $env:LIMIT (e.g. "debian-node") to patch a single node.
 
-  NOTE: in this standalone docker-compose AWX the job is created but fails at
-  start with "no Execution Environment could be found" (no podman runtime;
-  see README "Known limitation"). Patch the fleet via ansible-playbook instead.
+  The first run pulls the execution environment image (~1.5 GB) inside
+  awx-receptor, so it sits in "running" for a few minutes before any output.
 #>
 $ErrorActionPreference = "Stop"
 
@@ -24,7 +23,7 @@ if ($Jt.results.Count -eq 0) {
 }
 $JtId = $Jt.results[0].id
 
-$Job = Invoke-RestMethod -Headers $Headers -Method Post -Uri "$AwxUrl/api/v2/job_templates/$JtId/launch/"
+$Body = if ($env:LIMIT) { @{ limit = $env:LIMIT } | ConvertTo-Json } else { "{}" }
+$Job = Invoke-RestMethod -Headers $Headers -Method Post -ContentType "application/json" -Body $Body -Uri "$AwxUrl/api/v2/job_templates/$JtId/launch/"
 Write-Host "==> Launched job: $AwxUrl$($Job.url)"
-Write-Host "==> Expect it to fail with 'no Execution Environment could be found' (known limitation, see README)."
-Write-Host "    To actually patch the fleet (from WSL2): ansible-playbook -i ansible/inventory.ini ansible/patch.yml"
+Write-Host "==> Watch it in the UI: Views -> Jobs. The JSON patch report is on the job's Artifacts tab."

@@ -4,7 +4,8 @@
 
 .EXAMPLE
   ./scripts/teardown.ps1
-  ./scripts/teardown.ps1 -Volumes   # also wipes AWX's postgres/projects data
+  ./scripts/teardown.ps1 -Volumes   # also wipes AWX's data volumes (postgres, projects,
+                                    # job dirs, execution environment image cache)
 #>
 param(
     [switch]$Volumes

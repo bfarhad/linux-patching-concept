@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tear down the lab. Pass --volumes to also wipe AWX's postgres/projects data.
+# Tear down the lab. Pass --volumes to also wipe AWX's data volumes (postgres,
+# projects, job dirs, and the ~1.5 GB execution environment image cache).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

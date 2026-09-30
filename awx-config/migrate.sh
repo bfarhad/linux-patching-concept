@@ -22,4 +22,7 @@ awx-manage provision_instance --hostname="${CLUSTER_HOST_ID:-awx}" || true
 awx-manage register_queue --queuename=controlplane --hostnames="${CLUSTER_HOST_ID:-awx}" || true
 awx-manage register_queue --queuename=default --hostnames="${CLUSTER_HOST_ID:-awx}" || true
 
+echo "==> Registering default execution environments..."
+awx-manage register_default_execution_environments || true
+
 echo "==> Migrations complete."
